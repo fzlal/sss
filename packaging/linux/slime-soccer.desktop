@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Super Slime Soccer
+GenericName=Arcade Sports Game
+Comment=Slime football, volleyball and basketball
+Exec=slime-soccer
+Icon=slime-soccer
+Terminal=false
+Categories=Game;ArcadeGame;
+Keywords=soccer;football;volleyball;basketball;slime;arcade;
+StartupNotify=true

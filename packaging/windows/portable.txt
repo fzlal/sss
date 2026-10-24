@@ -1,0 +1,9 @@
+Super Slime Soccer — portable mode
+==================================
+
+Keep this file next to slime-soccer.exe to store settings and career progress
+in save.json in this folder instead of %APPDATA%\slime-soccer\save.json.
+
+Remove this file to use the normal per-user save location. Extract the zip to
+a writable folder; the game cannot save next to an executable in a read-only
+folder.

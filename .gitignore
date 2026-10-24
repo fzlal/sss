@@ -1,0 +1,9 @@
+# Cargo build output. Reproducible from Cargo.lock and never committed.
+/target/
+
+# Distribution archives produced by packaging scripts.
+/dist/
+
+# Python bytecode from the asset tools.
+__pycache__/
+*.py[cod]

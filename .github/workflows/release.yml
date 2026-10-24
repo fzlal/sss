@@ -1,0 +1,315 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Validate version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read Cargo.toml version and check the tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [[ -z "$version" ]]; then
+            echo "::error::Could not read the package version from Cargo.toml"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "v$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match v$version in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  check:
+    name: Tests and lints
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-check
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libgl1-mesa-dev libx11-dev libxcursor-dev \
+            libxi-dev libxinerama-dev libxrandr-dev pkg-config
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+  build:
+    name: ${{ matrix.name }}
+    needs: [prepare, check]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            platform: linux
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            installer: false
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            platform: linux
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            installer: false
+          - name: macos-universal
+            os: macos-15
+            platform: macos
+            target: universal
+            arch: universal
+            installer: false
+          - name: windows-x86_64
+            os: windows-2022
+            platform: windows
+            target: x86_64-pc-windows-msvc
+            arch: x86_64
+            installer: true
+          - name: windows-i686
+            os: windows-2022
+            platform: windows
+            target: i686-pc-windows-msvc
+            arch: i686
+            installer: true
+          - name: windows-aarch64
+            os: windows-11-arm
+            platform: windows
+            target: aarch64-pc-windows-msvc
+            arch: aarch64
+            installer: false
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Rust target(s)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$PLATFORM" == "macos" ]]; then
+            rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          else
+            rustup target add "$TARGET"
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libgl1-mesa-dev libx11-dev libxcursor-dev \
+            libxi-dev libxinerama-dev libxrandr-dev pkg-config
+
+      - name: Install Linux packaging tools
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            rpm binutils file desktop-file-utils
+
+      - name: Build Linux
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Build Windows
+        if: matrix.platform == 'windows'
+        shell: bash
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Build macOS universal
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p target/universal
+          lipo -create \
+            -output target/universal/slime-soccer \
+            target/aarch64-apple-darwin/release/slime-soccer \
+            target/x86_64-apple-darwin/release/slime-soccer
+          lipo -info target/universal/slime-soccer
+
+      - name: Smoke test Linux/macOS binary
+        if: matrix.platform == 'linux' || matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$PLATFORM" == "macos" ]]; then
+            binary="target/universal/slime-soccer"
+          else
+            binary="target/${TARGET}/release/slime-soccer"
+          fi
+          "$binary" --help >/dev/null
+
+      - name: Smoke test Windows binary
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          & "target\$env:TARGET\release\slime-soccer.exe" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows binary smoke test failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Strip Linux binary
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: strip "target/${TARGET}/release/slime-soccer"
+
+      - name: Package Linux
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          FORMATS=tar,deb,rpm,appimage \
+            bash packaging/linux/package.sh \
+            "$VERSION" "$ARCH" "target/${TARGET}/release/slime-soccer" dist
+
+      - name: Install NSIS
+        if: matrix.platform == 'windows' && matrix.installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis --no-progress -y
+          }
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            $candidates = @()
+            $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+            if ($programFilesX86) {
+              $candidates += Join-Path $programFilesX86 "NSIS\makensis.exe"
+            }
+            if ($env:ProgramFiles) {
+              $candidates += Join-Path $env:ProgramFiles "NSIS\makensis.exe"
+            }
+            $candidates += "C:\ProgramData\chocolatey\bin\makensis.exe"
+            if (-not ($candidates | Where-Object { Test-Path $_ })) {
+              throw "NSIS was installed but makensis is not available"
+            }
+          }
+
+      - name: Package Windows
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          SKIP_INSTALLER: ${{ matrix.installer == false }}
+        run: |
+          $params = @{
+            Version = $env:VERSION
+            Arch = $env:ARCH
+            Binary = "target\$env:TARGET\release\slime-soccer.exe"
+            Dist = "dist"
+          }
+          if ($env:SKIP_INSTALLER -eq "true") {
+            $params.SkipInstaller = $true
+          }
+          ./packaging/windows/package.ps1 @params
+
+      - name: Package macOS
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          bash packaging/macos/package.sh \
+            "$VERSION" target/universal/slime-soccer dist
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -maxdepth 1 -type f -printf '%f\n' | sort | while IFS= read -r file; do
+            sha256sum "$file"
+          done > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Super Slime Soccer v${{ needs.prepare.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          body_path: packaging/release-notes.md
+          files: dist/*
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
